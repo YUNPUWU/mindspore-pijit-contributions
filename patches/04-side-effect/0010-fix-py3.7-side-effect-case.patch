@@ -1,0 +1,44 @@
+From e24592a2211ee847f004f0b8b3c89db55bd6fac7 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E5=90=B4=E8=95=B4=E6=BA=A5?= <wuyunpu1@huawei.com>
+Date: Fri, 22 Mar 2024 10:39:35 +0800
+Subject: [PATCH] fix py3.7 side effect case bug
+
+---
+ mindspore/ccsrc/pipeline/jit/pi/graph_capture/graph_build.cc | 2 +-
+ mindspore/ccsrc/pipeline/jit/pi/graph_capture/side_effect.cc | 3 ---
+ 2 files changed, 1 insertion(+), 4 deletions(-)
+
+diff --git a/mindspore/ccsrc/pipeline/jit/pi/graph_capture/graph_build.cc b/mindspore/ccsrc/pipeline/jit/pi/graph_capture/graph_build.cc
+index d4045fe99..e8854457b 100644
+--- a/mindspore/ccsrc/pipeline/jit/pi/graph_capture/graph_build.cc
++++ b/mindspore/ccsrc/pipeline/jit/pi/graph_capture/graph_build.cc
+@@ -917,7 +917,6 @@ bool GraphBuilder::DoSideEffect(const Instr &instr, const std::vector<ValueNode
+     return false;
+   }
+   index = index < 0 ? (size + index) : index;
+-  items[index] = value;
+   AObject *object_info = AObject::BuildOperations(CollectObjects(items), BUILD_LIST);
+   new_node = NewValueNode(object_info, BUILD_LIST, items.size(), items);
+   if (!ReplaceAll(container, new_node)) {
+@@ -926,6 +925,7 @@ bool GraphBuilder::DoSideEffect(const Instr &instr, const std::vector<ValueNode
+   for (auto item : items) {
+     graph_->GetTracedNodes().push_back(item);
+   }
++  items[index] = value;
+   NewValueNode(nullptr, instr, {value, container, key});
+   graph_->GetSideEffect()->SetSideEffectNode(new_node);
+   graph_->GetSideEffect()->SetReplaceMap(new_node, container);
+diff --git a/mindspore/ccsrc/pipeline/jit/pi/graph_capture/side_effect.cc b/mindspore/ccsrc/pipeline/jit/pi/graph_capture/side_effect.cc
+index de6a130e0..05e067e5a 100644
+--- a/mindspore/ccsrc/pipeline/jit/pi/graph_capture/side_effect.cc
++++ b/mindspore/ccsrc/pipeline/jit/pi/graph_capture/side_effect.cc
+@@ -96,9 +96,6 @@ void SideEffect::RestoreSideEffect(CodeGenerator *code_gen) const {
+     if (item->GetOpcode() == BUILD_LIST) {
+       if (GetReplaceMap().size() != 0) {
+         for (auto &replace_map : GetReplaceMap()) {
+-          std::cout << replace_map.first->ToString() << std::endl;
+-          std::cout << replace_map.second->ToString() << std::endl;
+-
+           if (item == replace_map.first) {
+             code_gen->LoadValue(replace_map.second);
+           }

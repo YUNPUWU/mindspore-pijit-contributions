@@ -1,0 +1,187 @@
+From 8f94ed7cf4935b1fe2f5afde2b5ff44e9313f8f8 Mon Sep 17 00:00:00 2001
+From: wu-yunpu <wuyunpu1@huawei.com>
+Date: Sat, 30 Dec 2023 15:40:48 +0800
+Subject: [PATCH] add loop trace switch and store subscr default crack map
+
+---
+ .../jit/pi/graph_capture/code_generator.cc    |  6 ++---
+ .../jit/pi/graph_capture/graph_analyzer.cc    | 26 ++++++++++++-------
+ .../jit/pi/graph_capture/graph_analyzer.h     |  5 ++--
+ .../jit/pi/graph_capture/graph_build.cc       |  5 ++++
+ .../pipeline/jit/pi/graph_capture/node.cc     | 16 ++----------
+ .../pipeline/jit/pi/graph_capture/node.h      |  1 +
+ .../pi/graph_capture/special_func_infer.cc    |  1 -
+ 7 files changed, 31 insertions(+), 29 deletions(-)
+
+diff --git a/mindspore/ccsrc/pipeline/jit/pi/graph_capture/code_generator.cc b/mindspore/ccsrc/pipeline/jit/pi/graph_capture/code_generator.cc
+index d909b8ad6..893e5999f 100644
+--- a/mindspore/ccsrc/pipeline/jit/pi/graph_capture/code_generator.cc
++++ b/mindspore/ccsrc/pipeline/jit/pi/graph_capture/code_generator.cc
+@@ -301,7 +301,7 @@ static std::string MakeBrkName(const std::string &co_name, int bci) {
+   constexpr const char *mark = "B.";
+   constexpr const char *reg_mark = "\\d+B.";
+   return std::to_string(bci) + mark + std::regex_replace(co_name, std::regex(reg_mark), "");
+-};
++}
+ 
+ py::object CodeGenerator::Transform(const Code &ccode) {
+   std::unordered_map<std::string, int> names;
+@@ -1297,7 +1297,7 @@ static bool FindBlock(int start_bci, const CFG *cfg, int *end_bci, int *stack_ef
+   }
+   if (list[start_bci]->op() == FOR_ITER && block_end == start_bci - 1) {
+     // break at FOR_ITER and it is not a loop
+-    block_end = list[block_end]->extra_jump()->bci();
++    block_end = list[start_bci]->extra_jump()->bci() - 1;
+   }
+   *end_bci = block_end;
+   return block_end != start_bci - 1;
+@@ -1372,7 +1372,7 @@ static bool FindBlock(int start_bci, const CFG *cfg, int *end_bci, int *stack_ef
+   }
+   if (list[start_bci]->op() == FOR_ITER && *end_bci == start_bci - 1) {
+     // break at FOR_ITER and it is not a loop
+-    *end_bci = list[*end_bci]->extra_jump()->bci();
++    *end_bci = list[start_bci]->extra_jump()->bci() - 1;
+   }
+   return *end_bci != start_bci - 1;
+ }
+diff --git a/mindspore/ccsrc/pipeline/jit/pi/graph_capture/graph_analyzer.cc b/mindspore/ccsrc/pipeline/jit/pi/graph_capture/graph_analyzer.cc
+index c15dbe7c7..e22b1fb01 100644
+--- a/mindspore/ccsrc/pipeline/jit/pi/graph_capture/graph_analyzer.cc
++++ b/mindspore/ccsrc/pipeline/jit/pi/graph_capture/graph_analyzer.cc
+@@ -120,6 +120,21 @@ static bool CheckAttrItemSupport(ValueNode *v, bool repeat_op) {
+ }
+ 
+ extern bool CheckJitConstexpr(const py::object &func);
++bool GraphAnalyzer::HandleCallableToGraph(AObject *f) {
++  if (f == nullptr) {
++    return false;
++  }
++  // don't pass unknown callable to graph
++  bool is_known_func = f->GetType() == AObject::kTypeCell || f->GetType() == AObject::kTypePrimitive ||
++                       f->GetType() == AObject::kTypeMetaFuncGraph ||
++                       (f->GetType() == AObject::kTypeFunction && CheckJitConstexpr(f->GetPyObject()));
++  bool is_ms_support_func = f->TestMsFlag(kMsFlagSet);
++  if (!is_known_func && !is_ms_support_func) {
++    return false;
++  }
++  return true;
++}
++
+ bool GraphAnalyzer::AddToCaptured(ValueNode *v) {
+   if (IsNonLocalValue(v)) {
+     return true;
+@@ -132,15 +147,8 @@ bool GraphAnalyzer::AddToCaptured(ValueNode *v) {
+ 
+   if (Utils::IsCallOp(v->GetOpcode())) {
+     AObject *f = v->input(0)->GetVobj();
+-    if (f == nullptr) {
+-      return false;
+-    }
+-    // don't pass unknown callable to graph
+-    bool is_known_func = f->GetType() == AObject::kTypeCell || f->GetType() == AObject::kTypePrimitive ||
+-                         f->GetType() == AObject::kTypeMetaFuncGraph ||
+-                         (f->GetType() == AObject::kTypeFunction && CheckJitConstexpr(f->GetPyObject()));
+-    bool is_ms_support_func = f->TestMsFlag(kMsFlagSet);
+-    if (!is_known_func && !is_ms_support_func) {
++    bool can_pass = HandleCallableToGraph(f);
++    if (!can_pass) {
+       return false;
+     }
+     GetCaptureInfo().has_grad_ |= f->TestMsFlag(AObject::kMsFlagGradFunc);
+diff --git a/mindspore/ccsrc/pipeline/jit/pi/graph_capture/graph_analyzer.h b/mindspore/ccsrc/pipeline/jit/pi/graph_capture/graph_analyzer.h
+index f3d19a963..28da6fa65 100644
+--- a/mindspore/ccsrc/pipeline/jit/pi/graph_capture/graph_analyzer.h
++++ b/mindspore/ccsrc/pipeline/jit/pi/graph_capture/graph_analyzer.h
+@@ -19,7 +19,7 @@
+ #include <set>
+ #include <vector>
+ #include "pipeline/jit/pi/graph_capture/cfg.h"
+-
++#include "pipeline/jit/pi/graph_capture/abstract_object.h"
+ namespace mindspore {
+ namespace jit {
+ namespace graph {
+@@ -48,13 +48,14 @@ class GraphAnalyzer {
+   const auto &GetCaptureInfo() const { return info_; }
+   void Analyze();
+   bool HasTensorOperation() const;
+-  bool NeedInterpret() const { return need_interpret_; };
++  bool NeedInterpret() const { return need_interpret_; }
+ 
+  private:
+   bool AnalyzeRecursive(Graph *g);
+   bool AnalyzeCall(CallNode *);
+   bool TryToCapture(AbstractNode *value);
+   bool AddToCaptured(ValueNode *value);
++  bool HandleCallableToGraph(AObject *f);
+   void AddToEscaped(ValueNode *value);
+   bool ProduceInterpretValue(ValueNode *v);
+   void CollectInputs();
+diff --git a/mindspore/ccsrc/pipeline/jit/pi/graph_capture/graph_build.cc b/mindspore/ccsrc/pipeline/jit/pi/graph_capture/graph_build.cc
+index 8abfeae67..d98e1a846 100644
+--- a/mindspore/ccsrc/pipeline/jit/pi/graph_capture/graph_build.cc
++++ b/mindspore/ccsrc/pipeline/jit/pi/graph_capture/graph_build.cc
+@@ -2230,6 +2230,11 @@ StopTraceReason GraphBuilder::TraceRun() {
+       graph_->SetRetVal(pop());
+       break;
+     }
++    Block *loop_head = graph_->GetCFG()->GetBlockByBci(cur_bci_);
++    if (loop_head->is_loop_head()) {
++      graph_->StopTraceAt(cur_bci_, StopTraceReason::kStopTraceLoop_Unsupported);
++      return StopTraceReason::kStopTraceLoop_Unsupported;
++    }
+     if (!DoByteCode(*instrs[cur_bci_])) {
+       break;
+     }
+diff --git a/mindspore/ccsrc/pipeline/jit/pi/graph_capture/node.cc b/mindspore/ccsrc/pipeline/jit/pi/graph_capture/node.cc
+index 427462183..2138ff939 100644
+--- a/mindspore/ccsrc/pipeline/jit/pi/graph_capture/node.cc
++++ b/mindspore/ccsrc/pipeline/jit/pi/graph_capture/node.cc
+@@ -29,21 +29,9 @@ bool IsNonLocalValue(ValueNode *i) {
+          i->GetType() == ValueNode::FreeVar;
+ }
+ 
+-void ValueNode::store_attr(const std::string &nam, ValueNode *v) {
+-  // TODO(chaiyouheng): track variable modify, replace all node that represent the same object
+-  if (vobj_) {
+-    vobj_->SetAttr(nam, v->vobj_);
+-  }
+-  attr_ = true;
+-}
++void ValueNode::store_attr(const std::string &nam, ValueNode *v) { attr_ = true; }
+ 
+-void ValueNode::store_subscr(ValueNode *sub, ValueNode *v) {
+-  // TODO(chaiyouheng): track variable modify, replace all node that represent the same object
+-  if (vobj_) {
+-    vobj_->SetItem(sub->vobj_, v->vobj_);
+-  }
+-  subscr_ = true;
+-}
++void ValueNode::store_subscr(ValueNode *sub, ValueNode *v) { subscr_ = true; }
+ 
+ AObject *ValueNode::get_attr(const std::string &nam) {
+   if (!attr_ && vobj_) {
+diff --git a/mindspore/ccsrc/pipeline/jit/pi/graph_capture/node.h b/mindspore/ccsrc/pipeline/jit/pi/graph_capture/node.h
+index 50f21b5a0..22f1d8654 100644
+--- a/mindspore/ccsrc/pipeline/jit/pi/graph_capture/node.h
++++ b/mindspore/ccsrc/pipeline/jit/pi/graph_capture/node.h
+@@ -17,6 +17,7 @@
+ #define MINDSPORE_CCSRC_PIPELINE_GRAPH_JIT_GRAPH_CAPTURE_NODE_H
+ 
+ #include <string>
++#include <map>
+ #include <vector>
+ #include "utils/log_adapter.h"
+ #include "pipeline/jit/pi/graph_capture/abstract_object.h"
+diff --git a/mindspore/ccsrc/pipeline/jit/pi/graph_capture/special_func_infer.cc b/mindspore/ccsrc/pipeline/jit/pi/graph_capture/special_func_infer.cc
+index 02f1dbdb8..8ed14b247 100644
+--- a/mindspore/ccsrc/pipeline/jit/pi/graph_capture/special_func_infer.cc
++++ b/mindspore/ccsrc/pipeline/jit/pi/graph_capture/special_func_infer.cc
+@@ -200,7 +200,6 @@ bool GuardConstCallNodeParam(CallNode *call_node, Graph *sub_graph, int max_guar
+   }
+ 
+   const auto &guard = sub_graph->GetGuard()->GetGuard();
+-  std::pair<std::vector<GuardItemPtr>, std::map<std::string, GuardItemPtr>> guard_backup;
+   guard->Backup();
+   for (const auto &i : traces) {
+     if (!guard->GuardOn(i.first, i.second)) {

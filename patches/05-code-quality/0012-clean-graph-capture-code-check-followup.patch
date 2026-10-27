@@ -1,0 +1,21 @@
+From 3870bf675da68472e30db1b6174cae6ac4181ebc Mon Sep 17 00:00:00 2001
+From: wu-yunpu <wuyunpu1@huawei.com>
+Date: Mon, 25 Mar 2024 11:04:35 +0800
+Subject: [PATCH] clean graph capture code check
+
+---
+ mindspore/ccsrc/pipeline/jit/pi/graph_capture/code_generator.cc | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/mindspore/ccsrc/pipeline/jit/pi/graph_capture/code_generator.cc b/mindspore/ccsrc/pipeline/jit/pi/graph_capture/code_generator.cc
+index 96a60b17f..1c5c81da5 100644
+--- a/mindspore/ccsrc/pipeline/jit/pi/graph_capture/code_generator.cc
++++ b/mindspore/ccsrc/pipeline/jit/pi/graph_capture/code_generator.cc
+@@ -925,6 +925,7 @@ void CodeBreakGenerator::BreakAtBlock(CodeGenerator *code_gen, int untracked_bci
+   for (BitMap::Iter iter(&alive, true), end(&alive, false); iter != end; ++iter) {
+     alive_locals_.push_back(*iter);
+   }
++
+   interpret_.outputs.resize(alive_locals_.size(), &ValueNode::kUnboundLocal);
+   untracked_stack_effect = 0;
+ 

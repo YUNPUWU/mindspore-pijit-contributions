@@ -1,0 +1,24 @@
+From 584a5191caf4a3b11ff8491717369fd66cf3aacb Mon Sep 17 00:00:00 2001
+From: wu-yunpu <wuyunpu1@huawei.com>
+Date: Sat, 6 Jan 2024 15:36:13 +0800
+Subject: [PATCH] fix listextend bugs
+
+---
+ mindspore/ccsrc/pipeline/jit/pi/graph_capture/graph_build.cc | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/mindspore/ccsrc/pipeline/jit/pi/graph_capture/graph_build.cc b/mindspore/ccsrc/pipeline/jit/pi/graph_capture/graph_build.cc
+index 3798a838f..1dcc32942 100644
+--- a/mindspore/ccsrc/pipeline/jit/pi/graph_capture/graph_build.cc
++++ b/mindspore/ccsrc/pipeline/jit/pi/graph_capture/graph_build.cc
+@@ -926,8 +926,8 @@ static bool ReplaceMergeOp(ValueNode *container) {
+         if (arg->GetVobj() != nullptr && arg->GetVobj()->GetType() == AObject::kTypeTuple) {
+           for (auto item : arg->GetVobj()->GetPyObject()) {
+             ValueNode *v;
+-            v = container->GetGraph()->allocator.NewNode<ValueNode>(
+-              AObject::Convert(item::ptr()), LOAD_CONST, -1, std::vector<ValueNode *>());
++            v = container->GetGraph()->allocator().NewNode<ValueNode>(AObject::Convert(item.ptr()), LOAD_CONST, -1,
++                                                                      std::vector<ValueNode *>());
+             v->SetGraph(container->GetGraph());
+             inputs.push_back(v);
+           }

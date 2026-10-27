@@ -1,0 +1,785 @@
+From a08068927d5e939aa49fa0b24b2a0c50ba18a235 Mon Sep 17 00:00:00 2001
+From: wu-yunpu <wuyunpu1@huawei.com>
+Date: Tue, 12 Mar 2024 19:19:42 +0800
+Subject: [PATCH] fix side effect bug
+
+---
+ .../jit/pi/graph_capture/bytecode_inliner.cc  |  28 +----
+ .../jit/pi/graph_capture/code_generator.cc    |  78 +-----------
+ .../jit/pi/graph_capture/code_generator.h     |   3 -
+ .../pipeline/jit/pi/graph_capture/graph.cc    |   3 +
+ .../pipeline/jit/pi/graph_capture/graph.h     |  25 +---
+ .../jit/pi/graph_capture/graph_analyzer.cc    |  38 ++++--
+ .../jit/pi/graph_capture/graph_analyzer.h     |   1 +
+ .../jit/pi/graph_capture/graph_build.cc       |  11 +-
+ .../jit/pi/graph_capture/side_effect.cc       | 115 +++++++++++++++++-
+ .../jit/pi/graph_capture/side_effect.h        |  46 ++++---
+ .../pi/graph_capture/special_func_infer.cc    |  16 +--
+ .../pi_jit/control_flow/test_side_effect.py   |  83 +++++++++----
+ 12 files changed, 246 insertions(+), 201 deletions(-)
+
+diff --git a/mindspore/ccsrc/pipeline/jit/pi/graph_capture/bytecode_inliner.cc b/mindspore/ccsrc/pipeline/jit/pi/graph_capture/bytecode_inliner.cc
+index 59469f706..efcb9bbe9 100644
+--- a/mindspore/ccsrc/pipeline/jit/pi/graph_capture/bytecode_inliner.cc
++++ b/mindspore/ccsrc/pipeline/jit/pi/graph_capture/bytecode_inliner.cc
+@@ -145,22 +145,12 @@ void BytecodeInliner::Rebuild() {
+   }
+ 
+   if (graph_->Config().GetBoolConfig(GraphJitConfig::kEnableEliminateUnusedOperation)) {
+-    for (auto item : graph_->GetSideEffectNodes()) {
+-      if (item->GetOpcode() == BUILD_LIST) {
+-        ns.outputs.push_back(item);
+-      }
+-    }
+-    for (auto replace_map : graph_->GetSideEffectReplacedMap()) {
+-      ns.outputs.push_back(replace_map.second);
+-      for (auto item : replace_map.second->getInputs()) {
+-        ns.outputs.push_back(item);
+-      }
+-    }
+     // erase dead local between inline and code rebuild
+     EraseDeadLocal(ns.outputs);
+     EliminateClosureSideEffect();
+   }
+   Rebuild(&cg);
++
+   if (last_frame_ != nullptr) {
+     std::for_each(ns.outputs.begin(), ns.outputs.end(), [&cg](ValueNode *i) { cg.LoadValue(i); });
+     std::for_each(alive_locals.rbegin(), alive_locals.rend(), [&cg](int i) { cg.NewInstr(STORE_FAST, i); });
+@@ -193,19 +183,9 @@ void BytecodeInliner::CollectTracedNodes(Graph *graph) {
+     std::copy(call_node->GetParams().begin(), call_node->GetParams().end(), std::back_inserter(traced_nodes_));
+     CollectTracedNodes(call_node->GetSubGraph());
+   }
+-  // collect side_effect_nodes // graph_ is top graph
+-
+-  if (graph->GetSideEffect() != nullptr) {
+-    graph_->GetSideEffect()->ReprocessVariableMutationMaps();
+-
+-    for (auto side_effect_item : graph->GetSideEffect()->GetSideEffectInstrs()) {
+-      graph_->SetSideEffectNode(side_effect_item.first);
+-    }
+-    for (auto side_effect_item : graph->GetSideEffect()->GetReplaceMaps()) {
+-      graph_->SetSideEffectReplacedMap(side_effect_item.first, side_effect_item.second);
+-    }
+-    for (auto item : graph->GetSideEffect()->GetGlobalList()) {
+-      graph_->SetGlobalList(item);
++  if (graph != graph_) {
++    if (graph->GetSideEffect() != nullptr) {
++      graph_->GetSideEffect()->Merge(graph->GetSideEffect());
+     }
+   }
+ }
+diff --git a/mindspore/ccsrc/pipeline/jit/pi/graph_capture/code_generator.cc b/mindspore/ccsrc/pipeline/jit/pi/graph_capture/code_generator.cc
+index 6c7c9bd19..2ad7e4ea7 100644
+--- a/mindspore/ccsrc/pipeline/jit/pi/graph_capture/code_generator.cc
++++ b/mindspore/ccsrc/pipeline/jit/pi/graph_capture/code_generator.cc
+@@ -560,13 +560,11 @@ void CodeGenerator::LoadValue(ValueNode *node) {
+     }
+     return;
+   }
+-
+   int opcode = node->GetOpcode();
+   if (opcode == LOAD_DEREF) {
+     NewInstr(opcode, node->GetOparg());
+     return;
+   }
+-
+   std::string key = node->GetName();
+   if (opcode == LOAD_GLOBAL) {
+     PyObject *globals = node->GetGraph() ? node->GetGraph()->GetGlobals().ptr() : nullptr;
+@@ -807,49 +805,6 @@ void CodeBreakGenerator::RestoreLocals(CodeGenerator *code_gen, bool only_load)
+   code_gen->AddInstrs(std::move(st));
+ }
+ 
+-void CodeBreakGenerator::CallSideEffectCode(CodeGenerator *code_gen, Graph *graph) {
+-  for (auto &item : graph->GetSideEffectNodes()) {
+-    if (item->GetOpcode() == BUILD_LIST) {
+-      code_gen->NewInstr(LOAD_FAST, 0);
+-      code_gen->LoadValue(item);
+-      code_gen->NewInstr(LOAD_CONST, 0);
+-      code_gen->GetCode().co_code.back()->set_cnst(py::none());
+-      code_gen->NewInstr(LOAD_CONST, 0);
+-      code_gen->GetCode().co_code.back()->set_cnst(py::none());
+-      code_gen->NewInstr(BUILD_SLICE, 0);
+-      code_gen->NewInstr(STORE_SUBSCR, 0);
+-      interpret_.outputs.erase(std::remove(interpret_.outputs.begin(), interpret_.outputs.end(), item),
+-                               interpret_.outputs.end());
+-    } else if (item->GetOpcode() == CALL_FUNCTION) {
+-      for (auto input : item->getInputs()) {
+-        if (input->GetOpcode() == CALL_FUNCTION) {
+-          continue;
+-        }
+-        code_gen->LoadValue(input);
+-        interpret_.outputs.erase(std::remove(interpret_.outputs.begin(), interpret_.outputs.end(), input),
+-                                 interpret_.outputs.end());
+-      }
+-      code_gen->NewInstr(item->GetOpcode(), item->GetOparg());
+-    }
+-  }
+-
+-  if (graph->GetSideEffectReplacedList().size() != 0) {
+-    for (auto item : graph->GetSideEffectReplacedList()) {
+-      interpret_.outputs.erase(std::remove(interpret_.outputs.begin(), interpret_.outputs.end(), item),
+-                               interpret_.outputs.end());
+-    }
+-  }
+-  for (auto &item : graph->GetGlobalList()) {
+-    if (item.getNode() != nullptr) {
+-      code_gen->LoadValue(item.getNode());
+-      code_gen->GetCode().co_code.back()->set_name(item.getName());
+-      code_gen->NewInstr(STORE_GLOBAL, 0);
+-    } else {
+-      code_gen->NewInstr(DELETE_GLOBAL, 0);
+-    }
+-  }
+-}
+-
+ py::object CodeBreakGenerator::MakeUntrackedCode(int untracked_bci, int untracked_stack_effect) const {
+   const int argc = interpret_.outputs.size() + untracked_stack_effect;
+   int stack_count = argc - alive_locals_.size();
+@@ -1068,8 +1023,11 @@ py::object CodeBreakGenerator::MakeCode(bool make_graph, Graph *graph) {
+   FixInterpretOuput(&code_gen);
+   // ... handle side effects
+   if (make_graph == false) {
+-    CallSideEffectCode(&code_gen, graph);
++    graph->GetSideEffect()->RestoreSideEffect(&code_gen);
++    auto vec = graph->GetSideEffect()->CollectSideEffectAliveNodes();
++    interpret_.outputs.resize(interpret_.outputs.size() - vec.size());
+   }
++
+   CallUntrackedCode(&code_gen);
+   MakeReturn(&code_gen);
+ 
+@@ -1146,35 +1104,11 @@ void CodeBreakGenerator::Init(const Graph *graph, const GraphAnalyzer::CapturedI
+   cfg_ = graph->GetCFG().get();
+   std::vector<ValueNode *> alive_nodes = graph->CollectAliveNode(break_bci_, &alive_locals_);
+ 
+-  for (auto item : graph->GetSideEffectNodes()) {
+-    if (item->GetOpcode() == BUILD_LIST) {
+-      alive_nodes.push_back(item);
+-    } else if (item->GetOpcode() == CALL_FUNCTION) {
+-      if (item->getInputs().size() != 0) {
+-        for (auto input_item : item->getInputs()) {
+-          if (input_item->GetOpcode() == CALL_FUNCTION) {
+-            continue;
+-          }
+-          alive_nodes.push_back(input_item);
+-        }
+-      }
+-    }
+-  }
+-  if (graph->GetSideEffectReplacedList().size() != 0) {
+-    auto replace_list = graph->GetSideEffectReplacedList();
+-    alive_nodes.insert(alive_nodes.end(), replace_list.begin(), replace_list.end());
+-  }
+-
+-  for (auto item : graph->GetGlobalList()) {
+-    if (item.getNode() != nullptr) {
+-      alive_nodes.push_back(item.getNode());
+-    }
+-  }
+-
+   interpret_.inputs = graph->GetFrame(0).GetLocals();
+   interpret_.outputs = std::move(alive_nodes);
+   interpret_.operations = info->ordered_escaped_locals;
+-
++  auto vec = graph->GetSideEffect()->CollectSideEffectAliveNodes();
++  interpret_.outputs.insert(interpret_.outputs.end(), vec.begin(), vec.end());
+   captured_.inputs = std::vector<ValueNode *>(info->captured_locals.inputs.begin(), info->captured_locals.inputs.end());
+   captured_.outputs = CollectGraphOutputs(info->escaped_locals, interpret_.outputs);
+   captured_.operations = info->captured_locals.order;
+diff --git a/mindspore/ccsrc/pipeline/jit/pi/graph_capture/code_generator.h b/mindspore/ccsrc/pipeline/jit/pi/graph_capture/code_generator.h
+index 18bf478fb..4b3d35a16 100644
+--- a/mindspore/ccsrc/pipeline/jit/pi/graph_capture/code_generator.h
++++ b/mindspore/ccsrc/pipeline/jit/pi/graph_capture/code_generator.h
+@@ -210,9 +210,6 @@ class CodeBreakGenerator {
+ 
+   void FixInterpretOuput(CodeGenerator *code_gen);
+ 
+-  // make call operations of side effect bytecode
+-  void CallSideEffectCode(CodeGenerator *code_gen, Graph *graph);
+-
+   // make function of untracked bytecode, build restore frame operations of untracked bytecode
+   py::object MakeUntrackedCode(int untracked_bci, int untracked_stack_effect) const;
+ 
+diff --git a/mindspore/ccsrc/pipeline/jit/pi/graph_capture/graph.cc b/mindspore/ccsrc/pipeline/jit/pi/graph_capture/graph.cc
+index cb316358b..05b52fee3 100644
+--- a/mindspore/ccsrc/pipeline/jit/pi/graph_capture/graph.cc
++++ b/mindspore/ccsrc/pipeline/jit/pi/graph_capture/graph.cc
+@@ -248,6 +248,9 @@ std::vector<ValueNode *> Graph::CollectAliveNode(int bci, std::vector<int> *ids,
+   if (map != nullptr) {
+     *map = std::move(alive);
+   }
++
++  auto vec = GetSideEffect()->CollectSideEffectAliveNodes();
++  result.insert(result.end(), vec.begin(), vec.end());
+   return result;
+ }
+ 
+diff --git a/mindspore/ccsrc/pipeline/jit/pi/graph_capture/graph.h b/mindspore/ccsrc/pipeline/jit/pi/graph_capture/graph.h
+index 39afaf13f..a3531f894 100644
+--- a/mindspore/ccsrc/pipeline/jit/pi/graph_capture/graph.h
++++ b/mindspore/ccsrc/pipeline/jit/pi/graph_capture/graph.h
+@@ -172,26 +172,7 @@ class Graph {
+   void SetParent(Graph *parent) { parent_ = parent; }
+   Graph *GetParent() const { return parent_; }
+ 
+-  auto &GetSideEffect() const { return sideEffect_; }
+-
+-  void SetSideEffectNode(ValueNode *node) { side_effect_nodes_.push_back(node); }
+-  std::vector<ValueNode *> &GetSideEffectNodes() { return side_effect_nodes_; }
+-  std::vector<ValueNode *> const &GetSideEffectNodes() const { return side_effect_nodes_; }
+-
+-  void SetSideEffectReplacedMap(ValueNode *newNode, ValueNode *old) { replace_map.insert({newNode, old}); }
+-  std::map<ValueNode *, ValueNode *> GetSideEffectReplacedMap() { return replace_map; }
+-  std::vector<ValueNode *> GetSideEffectReplacedList() const {
+-    std::vector<ValueNode *> replace_list;
+-    for (auto &item : replace_map) {
+-      replace_list.push_back(item.second);
+-    }
+-    return replace_list;
+-  }
+-  std::map<ValueNode *, ValueNode *> GetSideEffectReplacedMap() const { return replace_map; }
+-  void SetGlobalList(GlobalSideEffectNode node) { global_list.push_back(node); }
+-  std::vector<GlobalSideEffectNode> GetGlobalList() const { return global_list; }
+-  void SetOldBreakBci(int bci) { old_break_bci_ = bci; }
+-  int GetOldBreakBci() { return old_break_bci_; }
++  const auto &GetSideEffect() const { return sideEffect_; }
+ 
+   // collect alive node, output bitmap
+   std::vector<ValueNode *> CollectAliveNode(int bci, std::vector<int> * = nullptr, BitMap * = nullptr) const;
+@@ -234,10 +215,6 @@ class Graph {
+   int prune_branch_count_;
+   Graph *parent_{nullptr};
+   std::unique_ptr<SideEffect> sideEffect_;
+-  std::vector<ValueNode *> side_effect_nodes_;
+-  std::map<ValueNode *, ValueNode *> replace_map;
+-  std::vector<GlobalSideEffectNode> global_list;
+-  int old_break_bci_;
+ };
+ }  // namespace pijit
+ }  // namespace mindspore
+diff --git a/mindspore/ccsrc/pipeline/jit/pi/graph_capture/graph_analyzer.cc b/mindspore/ccsrc/pipeline/jit/pi/graph_capture/graph_analyzer.cc
+index 7af4b8e8a..a5bd90c5a 100644
+--- a/mindspore/ccsrc/pipeline/jit/pi/graph_capture/graph_analyzer.cc
++++ b/mindspore/ccsrc/pipeline/jit/pi/graph_capture/graph_analyzer.cc
+@@ -16,6 +16,7 @@
+ #include "pipeline/jit/pi/graph_capture/graph_analyzer.h"
+ #include <algorithm>
+ #include <unordered_set>
++#include <utility>
+ #include <string>
+ #include <vector>
+ #include "pipeline/jit/pi/pi_jit_config.h"
+@@ -210,7 +211,27 @@ void GraphAnalyzer::AddToEscaped(ValueNode *v) {
+ 
+ extern TracePtr GetTrace(ValueNode *node, bool strict, bool print, int depth, int max_depth);
+ 
++bool GraphAnalyzer::HandleSideEffectNodeForCapture(AbstractNode *capture_node) {
++  auto &replace_map = graph_->GetSideEffect()->GetReplaceMap();
++  bool find =
++    std::any_of(replace_map.begin(), replace_map.end(),
++                [&capture_node](std::pair<ValueNode *, ValueNode *> item) { return capture_node == item.second; });
++  if (find) {
++    return true;
++  }
++  for (auto &side_effect_node : graph_->GetSideEffect()->GetSideEffectNodes()) {
++    if (capture_node == side_effect_node && side_effect_node->GetOpcode() == CALL_FUNCTION) {
++      return true;
++    }
++  }
++  return false;
++}
++
+ bool GraphAnalyzer::TryToCapture(AbstractNode *n) {
++  if (HandleSideEffectNodeForCapture(n)) {
++    return true;
++  }
++
+   ValueNode *v = static_cast<ValueNode *>(n);
+   AObject *o = v->GetVobj();
+   if (IsNonLocalValue(v)) {
+@@ -326,7 +347,6 @@ void GraphAnalyzer::UseDefAnalyze() {
+       aliveLocals = GetAliveLocals(graph_);
+     }
+   }
+-  graph_->SetOldBreakBci(graph_->GetStopTraceBci());
+ }
+ 
+ void GraphAnalyzer::Analyze() {
+@@ -337,21 +357,13 @@ void GraphAnalyzer::Analyze() {
+     CleanCapturedValue();
+   }
+   UseDefAnalyze();
+-  for (auto item : graph_->GetSideEffect()->GetSideEffectInstrs()) {
+-    if (item.first->bci() > graph_->GetStopTraceBci() && (item.first->bci() < graph_->GetOldBreakBci())) {
+-      graph_->GetSideEffect()->GetSideEffectInstrs().erase(item.first);
+-    }
+-  }
+-  for (auto item : graph_->GetSideEffectNodes()) {
+-    if (item->bci() >= graph_->GetStopTraceBci()) {
+-      graph_->GetSideEffectNodes().erase(
+-        std::remove(graph_->GetSideEffectNodes().begin(), graph_->GetSideEffectNodes().end(), item),
+-        graph_->GetSideEffectNodes().end());
+-    }
++  if (graph_->GetStopTraceBci() != -1) {
++    graph_->GetSideEffect()->CleanSideEffects(graph_->GetStopTraceBci());
+   }
+   CollectInputs();
+ 
+   need_interpret_ = true;
++
+   if (graph_->GetStopTraceBci() != -1 || !GetCaptureInfo().ordered_escaped_locals.empty()) {
+     return;
+   }
+@@ -368,7 +380,7 @@ void GraphAnalyzer::Analyze() {
+   if (iter == end) {
+     need_interpret_ = false;
+   }
+-  if (!graph_->GetSideEffect()->GetSideEffectInstrs().empty()) {
++  if (!graph_->GetSideEffect()->GetSideEffectNodes().empty()) {
+     need_interpret_ = true;
+   }
+   if (!graph_->GetSideEffect()->GetGlobalList().empty()) {
+diff --git a/mindspore/ccsrc/pipeline/jit/pi/graph_capture/graph_analyzer.h b/mindspore/ccsrc/pipeline/jit/pi/graph_capture/graph_analyzer.h
+index 23fda7a2f..6f2f1bc86 100644
+--- a/mindspore/ccsrc/pipeline/jit/pi/graph_capture/graph_analyzer.h
++++ b/mindspore/ccsrc/pipeline/jit/pi/graph_capture/graph_analyzer.h
+@@ -74,6 +74,7 @@ class GraphAnalyzer {
+   bool AnalyzeRecursive(Graph *g);
+   bool AnalyzeCall(CallNode *);
+   bool TryToCapture(AbstractNode *value);
++  bool HandleSideEffectNodeForCapture(AbstractNode *capture_node);
+   bool AddToCaptured(ValueNode *value);
+   bool HandleCallableToGraph(AObject *f);
+   bool ProduceInterpretValue(ValueNode *v);
+diff --git a/mindspore/ccsrc/pipeline/jit/pi/graph_capture/graph_build.cc b/mindspore/ccsrc/pipeline/jit/pi/graph_capture/graph_build.cc
+index 904d0cdb3..b8f6829f9 100644
+--- a/mindspore/ccsrc/pipeline/jit/pi/graph_capture/graph_build.cc
++++ b/mindspore/ccsrc/pipeline/jit/pi/graph_capture/graph_build.cc
+@@ -671,12 +671,12 @@ bool GraphBuilder::DoGlobalAccess(const Instr &instr) {
+     case STORE_GLOBAL: {
+       auto global_node = pop();
+       GlobalSideEffectNode global_side_effect(instr.name(), global_node, GetGraph()->GetModuleName());
+-      graph_->GetSideEffect()->setGlobalList(global_side_effect);
++      graph_->GetSideEffect()->SetGlobalList(global_side_effect);
+       break;
+     }
+     case DELETE_GLOBAL: {
+       GlobalSideEffectNode global_side_effect(instr.name(), nullptr, GetGraph()->GetModuleName());
+-      graph_->GetSideEffect()->setGlobalList(global_side_effect);
++      graph_->GetSideEffect()->SetGlobalList(global_side_effect);
+       break;
+     }
+ 
+@@ -926,10 +926,9 @@ bool GraphBuilder::DoSideEffect(const Instr &instr, const std::vector<ValueNode
+   for (auto item : items) {
+     graph_->GetTracedNodes().push_back(item);
+   }
+-
+-  graph_->GetSideEffect()->setVariableMaps(new_node, value);
+-  graph_->GetSideEffect()->setReplaceMaps(new_node, container);
+-
++  NewValueNode(nullptr, instr, {value, container, key});
++  graph_->GetSideEffect()->SetSideEffectNode(new_node);
++  graph_->GetSideEffect()->SetReplaceMap(new_node, container);
+   graph_->GetTracedNodes().push_back(new_node);
+   return true;
+ }
+diff --git a/mindspore/ccsrc/pipeline/jit/pi/graph_capture/side_effect.cc b/mindspore/ccsrc/pipeline/jit/pi/graph_capture/side_effect.cc
+index 2dcc4dc82..de6a130e0 100644
+--- a/mindspore/ccsrc/pipeline/jit/pi/graph_capture/side_effect.cc
++++ b/mindspore/ccsrc/pipeline/jit/pi/graph_capture/side_effect.cc
+@@ -1,5 +1,3 @@
+-
+-
+ /**
+ 
+     Copyright 2023 Huawei Technologies Co., Ltd
+@@ -25,10 +23,115 @@
+ namespace mindspore {
+ namespace pijit {
+ 
+-void SideEffect::ReprocessVariableMutationMaps() {
+-  for (auto &pair : VariableMutationMaps) {
+-    if (getStopBci() && pair.first->bci() > getStopBci()) {
+-      VariableMutationMaps.erase(pair.first);
++void SideEffect::CleanSideEffects(int new_bci) {
++  for (auto item : GetSideEffectNodes()) {
++    if (item->bci() >= new_bci) {
++      GetSideEffectNodes().erase(std::remove(GetSideEffectNodes().begin(), GetSideEffectNodes().end(), item),
++                                 GetSideEffectNodes().end());
++    }
++  }
++}
++
++void SideEffect::ConvertReplaceList() {
++  for (auto item : replace_map) {
++    replace_list.push_back(item.first);
++  }
++}
++
++std::vector<ValueNode *> SideEffect::CollectSideEffectAliveNodes() const {
++  std::vector<ValueNode *> alive_nodes;
++  for (auto item : GetSideEffectNodes()) {
++    if (item->GetOpcode() == BUILD_LIST) {
++      alive_nodes.push_back(item);
++      if (GetReplaceMap().size() != 0) {
++        for (auto &replace_map : GetReplaceMap()) {
++          if (item == replace_map.first) {
++            alive_nodes.push_back(replace_map.second);
++          }
++        }
++      }
++    } else if (item->GetOpcode() == CALL_FUNCTION) {
++      if (item->getInputs().size() != 0) {
++        for (auto input_item : item->getInputs()) {
++          if (input_item->GetOpcode() == CALL_FUNCTION) {
++            continue;
++          }
++          alive_nodes.push_back(input_item);
++        }
++      }
++    }
++  }
++  if (GetReplaceList().size() != 0) {
++    auto replace_list = GetReplaceList();
++    alive_nodes.insert(alive_nodes.end(), replace_list.begin(), replace_list.end());
++  }
++
++  for (auto item : GetGlobalList()) {
++    if (item.getNode() != nullptr) {
++      alive_nodes.push_back(item.getNode());
++    }
++  }
++  return alive_nodes;
++}
++
++void SideEffect::Merge(const std::unique_ptr<SideEffect> &sub_side_effect) {
++  for (auto item : sub_side_effect->GetSideEffectNodes()) {
++    SetSideEffectNode(item);
++  }
++  for (auto item : sub_side_effect->GetReplaceMap()) {
++    SetReplaceMap(item.first, item.second);
++  }
++  sub_side_effect->ConvertReplaceList();
++  for (auto item : sub_side_effect->GetReplaceList()) {
++    SetReplaceList(item);
++  }
++
++  for (auto item : sub_side_effect->GetGlobalList()) {
++    SetGlobalList(item);
++  }
++}
++
++void SideEffect::RestoreSideEffect(CodeGenerator *code_gen) const {
++  for (auto &item : GetSideEffectNodes()) {
++    if (item->GetOpcode() == BUILD_LIST) {
++      if (GetReplaceMap().size() != 0) {
++        for (auto &replace_map : GetReplaceMap()) {
++          std::cout << replace_map.first->ToString() << std::endl;
++          std::cout << replace_map.second->ToString() << std::endl;
++
++          if (item == replace_map.first) {
++            code_gen->LoadValue(replace_map.second);
++          }
++        }
++      } else {
++        code_gen->NewInstr(LOAD_FAST, 0);
++      }
++
++      code_gen->LoadValue(item);
++      code_gen->NewInstr(LOAD_CONST, 0);
++      code_gen->GetCode().co_code.back()->set_cnst(py::none());
++      code_gen->NewInstr(LOAD_CONST, 0);
++      code_gen->GetCode().co_code.back()->set_cnst(py::none());
++      code_gen->NewInstr(BUILD_SLICE, 0);
++      code_gen->NewInstr(STORE_SUBSCR, 0);
++    } else if (item->GetOpcode() == CALL_FUNCTION) {
++      for (auto input : item->getInputs()) {
++        if (input->GetOpcode() == CALL_FUNCTION) {
++          continue;
++        }
++        code_gen->LoadValue(input);
++      }
++      code_gen->NewInstr(item->GetOpcode(), item->GetOparg());
++    }
++  }
++
++  for (auto const &item : GetGlobalList()) {
++    if (item.getNode() != nullptr) {
++      code_gen->LoadValue(item.getNode());
++      code_gen->GetCode().co_code.back()->set_name(item.getName());
++      code_gen->NewInstr(STORE_GLOBAL, 0);
++    } else {
++      code_gen->NewInstr(DELETE_GLOBAL, 0);
+     }
+   }
+ }
+diff --git a/mindspore/ccsrc/pipeline/jit/pi/graph_capture/side_effect.h b/mindspore/ccsrc/pipeline/jit/pi/graph_capture/side_effect.h
+index df7d91138..18ddfdc13 100644
+--- a/mindspore/ccsrc/pipeline/jit/pi/graph_capture/side_effect.h
++++ b/mindspore/ccsrc/pipeline/jit/pi/graph_capture/side_effect.h
+@@ -19,6 +19,7 @@
+ 
+ #include <set>
+ #include <map>
++#include <memory>
+ #include <string>
+ #include <vector>
+ #include <unordered_map>
+@@ -27,6 +28,8 @@
+ namespace mindspore {
+ namespace pijit {
+ 
++class CodeGenerator;
++
+ class GlobalSideEffectNode {
+  public:
+   explicit GlobalSideEffectNode(std::string node_name, ValueNode *node, const char *module_name)
+@@ -36,8 +39,8 @@ class GlobalSideEffectNode {
+   void setNode(ValueNode *node) { node_ = node; }
+   void setModule(const char *module_name) { module_name_ = module_name; }
+ 
+-  std::string getName() { return node_name_; }
+-  ValueNode *getNode() { return node_; }
++  std::string getName() const { return node_name_; }
++  ValueNode *getNode() const { return node_; }
+   const char *getModule() { return module_name_; }
+ 
+  private:
+@@ -48,24 +51,33 @@ class GlobalSideEffectNode {
+ 
+ class SideEffect {
+  public:
+-  void setVariableMaps(ValueNode *container, ValueNode *itemNode) {
+-    VariableMutationMaps.insert({container, itemNode});
+-  }
+-  void setReplaceMaps(ValueNode *newNode, ValueNode *old) { replaceMaps.insert({newNode, old}); }
+-  int getStopBci() { return StopBci; }
+-  void setStopBci(int bci) { StopBci = bci; }
+-  std::map<ValueNode *, ValueNode *> &GetSideEffectInstrs() { return VariableMutationMaps; }
+-  std::map<ValueNode *, ValueNode *> &GetReplaceMaps() { return replaceMaps; }
+-  void ReprocessVariableMutationMaps();
+-  std::vector<GlobalSideEffectNode> &GetGlobalList() { return GlobalList; }
++  void SetSideEffectNode(ValueNode *node) { side_effect_nodes.push_back(node); }
++  std::vector<ValueNode *> &GetSideEffectNodes() { return side_effect_nodes; }
++  std::vector<ValueNode *> const &GetSideEffectNodes() const { return side_effect_nodes; }
++
++  void SetReplaceMap(ValueNode *newNode, ValueNode *oldNode) { replace_map.insert({newNode, oldNode}); }
++  std::map<ValueNode *, ValueNode *> &GetReplaceMap() { return replace_map; }
++  std::map<ValueNode *, ValueNode *> const &GetReplaceMap() const { return replace_map; }
++
++  void ConvertReplaceList();
++  void SetReplaceList(ValueNode *node) { replace_list.push_back(node); }
++  std::vector<ValueNode *> &GetReplaceList() { return replace_list; }
++  std::vector<ValueNode *> const &GetReplaceList() const { return replace_list; }
++
++  void SetGlobalList(GlobalSideEffectNode global_side_effect) { global_list.push_back(global_side_effect); }
++  std::vector<GlobalSideEffectNode> &GetGlobalList() { return global_list; }
++  std::vector<GlobalSideEffectNode> const &GetGlobalList() const { return global_list; }
+ 
+-  void setGlobalList(GlobalSideEffectNode global_side_effect) { GlobalList.push_back(global_side_effect); }
++  std::vector<ValueNode *> CollectSideEffectAliveNodes() const;
++  void CleanSideEffects(int new_bci);
++  void RestoreSideEffect(CodeGenerator *) const;
++  void Merge(const std::unique_ptr<SideEffect> &sub_side_effect);
+ 
+  private:
+-  std::map<ValueNode *, ValueNode *> VariableMutationMaps;
+-  std::map<ValueNode *, ValueNode *> replaceMaps;
+-  int StopBci;
+-  std::vector<GlobalSideEffectNode> GlobalList;
++  std::vector<ValueNode *> side_effect_nodes;
++  std::map<ValueNode *, ValueNode *> replace_map;
++  std::vector<ValueNode *> replace_list;
++  std::vector<GlobalSideEffectNode> global_list;
+ };
+ 
+ }  // namespace pijit
+diff --git a/mindspore/ccsrc/pipeline/jit/pi/graph_capture/special_func_infer.cc b/mindspore/ccsrc/pipeline/jit/pi/graph_capture/special_func_infer.cc
+index 6ab74e2ea..035f5f425 100644
+--- a/mindspore/ccsrc/pipeline/jit/pi/graph_capture/special_func_infer.cc
++++ b/mindspore/ccsrc/pipeline/jit/pi/graph_capture/special_func_infer.cc
+@@ -968,7 +968,6 @@ bool InferListAppend(CallNode *call_node) {
+ }
+ 
+ static bool InferPopAsGet(CallNode *call_node) {
+-  Graph *sub_graph = call_node->GetSubGraph();
+   py::object func = call_node->input(0)->GetVobj()->GetPyObject();
+   PyObject *fPtr = func.ptr();
+   if (func.ptr() == nullptr || PyMethod_Check(fPtr)) {
+@@ -982,22 +981,11 @@ static bool InferPopAsGet(CallNode *call_node) {
+   if (pair.first.ptr() == nullptr) {
+     return SetCallResType<AObject::kTypeAnyValue>(call_node);
+   }
+-  func = py::cast<py::object>(PyMethod_GET_SELF(func.ptr())).attr("get");
+   PyObject *value = PyObject_Call(func.ptr(), pair.first.ptr(), pair.second.ptr());
+-  if (PyErr_Occurred()) {
+-    MS_LOG(ERROR) << "got an error " << py::error_already_set().what() << " at call the "
+-                  << std::string(py::str(func.ptr()));
+-    PyErr_Clear();
+-  }
+   call_node->SetVobj(AObject::Convert(value));
+   call_node->SetSubGraph(nullptr);
+-  Py_XDECREF(value);
+-  // guard value node call->
+-  if (!sub_graph->GuardValueNode(call_node)) {
+-    return false;
+-  }
+-  call_node->GetGraph()->GetSideEffect()->setVariableMaps(call_node, nullptr);
+-  return CallNodeReturnConst(call_node, sub_graph, call_node->GetVobj());
++  call_node->GetGraph()->GetSideEffect()->SetSideEffectNode(call_node);
++  return false;
+ }
+ 
+ // special function list
+diff --git a/tests/st/pi_jit/control_flow/test_side_effect.py b/tests/st/pi_jit/control_flow/test_side_effect.py
+index 050fc5173..bd0a80ac1 100644
+--- a/tests/st/pi_jit/control_flow/test_side_effect.py
++++ b/tests/st/pi_jit/control_flow/test_side_effect.py
+@@ -14,9 +14,20 @@
+ ''' test resolve of side effect in pijit , by break_count_ judge is support side effect handing'''
+ import pytest
+ from mindspore import jit, Tensor, context
++from mindspore.nn import Cell, ReLU
+ from mindspore._c_expression import get_code_extra
+ import dis
+ 
++class NetAssign0002(Cell):
++
++    def __init__(self):
++        super().__init__()
++        self.relu = ReLU()
++
++    def construct(self, x, y):
++        x[1] = y
++        return x
++
+ tmp = 1
+ 
+ @pytest.mark.level0
+@@ -34,32 +45,20 @@ def test_store_subscr_side_effect_1():
+         return x
+     jit(fn=func, mode="PIJit")([Tensor([1]), Tensor([1])])
+     jcr = get_code_extra(func)
++    new_code = jcr["code"]["compiled_code_"]
++    for i in dis.get_instructions(new_code):
++        if i.opname == "STORE_SUBSCR":
++            flag = True
++    assert flag
+     context.set_context(mode=context.PYNATIVE_MODE)
+-    assert jcr["break_count_"] == 0
+-
+ 
+-@pytest.mark.level0
+-@pytest.mark.platform_x86_cpu
+-@pytest.mark.env_onecard
+-def test_store_subscr_side_effect_2():
+-    """
+-    Feature: Test STORE SUBSCR + OPERATION
+-    Description: wipe out graph_break in store subscr has args
+-    Expectation: no exception
+-    """
+-    def func(x):
+-        x[0] += 1
+-        return x
+-    jit(fn=func, mode="PIJit")([Tensor([1]), Tensor([1])])
+-    jcr = get_code_extra(func)
+-    context.set_context(mode=context.PYNATIVE_MODE)
+     assert jcr["break_count_"] == 0
+ 
+ 
+ @pytest.mark.level0
+ @pytest.mark.platform_x86_cpu
+ @pytest.mark.env_onecard
+-def test_store_subscr_side_effect_3():
++def test_store_subscr_side_effect_2():
+     """
+     Feature: STORE_SUBSCR + NO_ARGS + OPERATION
+     Description: wipe out graph_break in store subscr no args
+@@ -77,7 +76,7 @@ def test_store_subscr_side_effect_3():
+ @pytest.mark.level0
+ @pytest.mark.platform_x86_cpu
+ @pytest.mark.env_onecard
+-def test_store_subscr_side_effect_4():
++def test_del_subscr_side_effect_3():
+     """
+     Feature: DEL_SUBSCR + NO_ARGS + OPERATION
+     Description: wipe out graph_break in store subscr no args
+@@ -100,7 +99,7 @@ def test_store_subscr_side_effect_4():
+ @pytest.mark.level0
+ @pytest.mark.platform_x86_cpu
+ @pytest.mark.env_onecard
+-def test_store_subscr_side_effect_5():
++def test_dict_pop_side_effect_4():
+     """
+     Feature: DICT POP side effect
+     Description: wipe out graph_break in dict pop no args
+@@ -118,7 +117,24 @@ def test_store_subscr_side_effect_5():
+ @pytest.mark.level0
+ @pytest.mark.platform_x86_cpu
+ @pytest.mark.env_onecard
+-def test_store_subscr_side_effect_6():
++def test_dict_pop_side_effect_5():
++    """
++    Feature: DICT POP side effect 2
++    Description: wipe out graph_break in dict pop as args
++    Expectation: no exception
++    """
++    def func(d):
++        d.pop("b")
++        return d
++    jit(fn=func, mode="PIJit")({"a": Tensor([1, 2]), "b": Tensor([1, 2])})
++    jcr = get_code_extra(func)
++    context.set_context(mode=context.PYNATIVE_MODE)
++    assert jcr["break_count_"] == 0
++
++@pytest.mark.level0
++@pytest.mark.platform_x86_cpu
++@pytest.mark.env_onecard
++def test_store_global_side_effect_6():
+     """
+     Feature: STORE_GLOBAL
+     Description: wipe out graph_break in store global no args
+@@ -137,7 +153,7 @@ def test_store_subscr_side_effect_6():
+ @pytest.mark.level0
+ @pytest.mark.platform_x86_cpu
+ @pytest.mark.env_onecard
+-def test_store_subscr_side_effect_7():
++def test_del_global_side_effect_7():
+     """
+     Feature: DEL GLOBAL side effect
+     Description: wipe out graph_break in dict pop no args
+@@ -147,8 +163,31 @@ def test_store_subscr_side_effect_7():
+         global tmp
+         tmp = Tensor([1])
+         tmp *= 2
++        del tmp
+         return tmp
+     jit(fn=func, mode="PIJit")
+     jcr = get_code_extra(func)
+     context.set_context(mode=context.PYNATIVE_MODE)
+     assert jcr["break_count_"] == 0
++
++@pytest.mark.level0
++@pytest.mark.platform_x86_cpu
++@pytest.mark.env_onecard
++def test_fix_bug_store_subscr_side_effect_1():
++    """
++    Feature: STORE SUBSCR + FIX BUGS
++    Description: wipe out graph_break in store subscr has args
++    Expectation: no exception
++    """
++    def func():
++        net = NetAssign0002()
++        x = [Tensor([1, 2]), Tensor([2, 3])]
++        y = Tensor([5, 6])
++        out = net(x, y)
++        print(out)
++        return x
++
++    jit(fn=func, mode="PIJit")
++    jcr = get_code_extra(func)
++
++    assert jcr["break_count_"] == 0

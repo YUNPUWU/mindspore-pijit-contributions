@@ -1,0 +1,49 @@
+From b053d50efe0efde5f57b4416726d12471299a6ab Mon Sep 17 00:00:00 2001
+From: wu-yunpu <wuyunpu1@huawei.com>
+Date: Fri, 5 Jan 2024 15:54:17 +0800
+Subject: [PATCH] fix LIST EXTEND failed and kwonlyargs bug
+
+---
+ .../jit/pi/graph_capture/code_generator.cc        |  2 +-
+ .../pipeline/jit/pi/graph_capture/graph_build.cc  | 15 +++++++++++++++
+ 2 files changed, 16 insertions(+), 1 deletion(-)
+
+diff --git a/mindspore/ccsrc/pipeline/jit/pi/graph_capture/code_generator.cc b/mindspore/ccsrc/pipeline/jit/pi/graph_capture/code_generator.cc
+index 5b36f1323..d4468d3c2 100644
+--- a/mindspore/ccsrc/pipeline/jit/pi/graph_capture/code_generator.cc
++++ b/mindspore/ccsrc/pipeline/jit/pi/graph_capture/code_generator.cc
+@@ -902,7 +902,7 @@ py::object CodeBreakGenerator::MakeCode(bool make_graph) {
+   nlocals = std::max(nlocals, co_->co_nlocals);
+   nlocals = std::max(nlocals, cfg_->GetLocalCount());
+ 
+-  code_gen.SetArgsInfo(co_->co_argcount, co_->co_kwonlyargcount);
++  code_gen.SetArgsInfo(co_->co_argcount + co_->co_kwonlyargcount, 0);
+   code_gen.SetLocalsCount(nlocals);
+   code_gen.SetCodeFlags(co_->co_flags);
+   code_gen.SetFirstLineNumber(co_->co_firstlineno);
+diff --git a/mindspore/ccsrc/pipeline/jit/pi/graph_capture/graph_build.cc b/mindspore/ccsrc/pipeline/jit/pi/graph_capture/graph_build.cc
+index 5be904971..3798a838f 100644
+--- a/mindspore/ccsrc/pipeline/jit/pi/graph_capture/graph_build.cc
++++ b/mindspore/ccsrc/pipeline/jit/pi/graph_capture/graph_build.cc
+@@ -922,6 +922,21 @@ static bool ReplaceMergeOp(ValueNode *container) {
+       container->SetOparg(inputs.size());
+       break;
+     case LIST_EXTEND:
++      if (arg->GetOpcode() == LOAD_CONST) {
++        if (arg->GetVobj() != nullptr && arg->GetVobj()->GetType() == AObject::kTypeTuple) {
++          for (auto item : arg->GetVobj()->GetPyObject()) {
++            ValueNode *v;
++            v = container->GetGraph()->allocator.NewNode<ValueNode>(
++              AObject::Convert(item::ptr()), LOAD_CONST, -1, std::vector<ValueNode *>());
++            v->SetGraph(container->GetGraph());
++            inputs.push_back(v);
++          }
++          container->getInputs() = inputs;
++          container->SetOpcode(BUILD_LIST);
++          container->SetOparg(inputs.size());
++          break;
++        }
++      }
+       if (arg->GetOpcode() != BUILD_LIST && arg->GetOpcode() != BUILD_TUPLE) {
+         return false;
+       }

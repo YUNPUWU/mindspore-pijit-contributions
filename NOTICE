@@ -1,0 +1,17 @@
+MindSpore PIJit contributions by YUNPUWU (wu-yunpu)
+
+This repository contains patches, file snapshots and code excerpts taken from
+MindSpore (https://github.com/mindspore-ai/mindspore / https://gitee.com/mindspore/mindspore).
+
+MindSpore
+Copyright 2019-2020 Huawei Technologies Co., Ltd
+
+The code is licensed under the Apache License, Version 2.0 (see LICENSE).
+The patches in patches/ are unmodified output of `git format-patch` on the
+upstream commits. Files in src/ and excerpts/ are unmodified copies of upstream
+files or functions at commit a8005072ba60ddeafffa84ea3d6953f95db179d0, with a
+short header comment added to each excerpt file.
+
+The documentation (README*.md, docs/) was written by the repository author.
+This repository is a personal portfolio and is not affiliated with Huawei or
+the MindSpore community.
