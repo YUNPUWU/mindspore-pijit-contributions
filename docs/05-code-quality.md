@@ -1,47 +1,47 @@
-# 05 graph_capture 静态检查清理
+# 05 Static-Analysis Clean-up in graph_capture
 
-| 提交 | 日期 | PR | 补丁 |
+| Commit | Date | PR | Patch |
 | --- | --- | --- | --- |
-| `fb8baeb` clean graph capture code check（主线） | 2024-03-25 | !67269 | [0011](../patches/05-code-quality/0011-clean-graph-capture-code-check.patch) |
-| `e6ddc9d` 同上（r2.3 分支版本） | 2024-03-25 | !67140 | [variants](../patches/variants/r2.3-clean-graph-capture-code-check.patch) |
-| `3870bf6` 同上（补一行格式） | 2024-03-25 | 经 !70706 同步进主线 | [0012](../patches/05-code-quality/0012-clean-graph-capture-code-check-followup.patch) |
+| `fb8baeb` clean graph capture code check (mainline) | 2024-03-25 | !67269 | [0011](../patches/05-code-quality/0011-clean-graph-capture-code-check.patch) |
+| `e6ddc9d` same change (r2.3 branch version) | 2024-03-25 | !67140 | [variants](../patches/variants/r2.3-clean-graph-capture-code-check.patch) |
+| `3870bf6` same change (one-line formatting follow-up) | 2024-03-25 | synced into mainline via !70706 | [0012](../patches/05-code-quality/0012-clean-graph-capture-code-check-followup.patch) |
 
-7 个文件，+54 / −67 行，不改变功能，目的是让 `graph_capture/` 目录通过 MindSpore 合入流程中的静态检查（codecheck）。
+7 files, +54 / −67 lines, no functional change. The goal was to make the `graph_capture/` directory pass the static analysis (codecheck) in MindSpore's merge pipeline.
 
-## 处理的告警类型
+## Warning types addressed
 
-| 类型 | 例子 | 处理方式 |
+| Type | Example | Fix |
 | --- | --- | --- |
-| 有符号数参与位运算 | `tp->tp_flags & fast_type_mask`、`oparg & 0x08`、`track_result_ & (1 << kTrackBreak)` | 显式转换为 `unsigned` 后再做位运算 |
-| 隐式窄化（`size_t` 转 `int`） | `int block_count = bb.size();`、`int nlocals = code_gen.GetLocalsMap().size();` | 改为 `static_cast<int>(...)` |
-| 保留标识符 | 自定义宏 `_Py_MAKECODEUNIT` | 改名为 `PY_MAKECODEUNIT`。下划线加大写字母开头的名字是 C/C++ 保留给实现的；这个名字也和 CPython 头文件里的同名宏冲突，原代码只能靠 `#ifndef` 回避 |
-| switch 分支缺少返回 | `IsRepeatWithoutSideEffect` 中 `case` 内部只有条件 return | 补上 `return false;`，避免隐式贯穿到 `default` |
-| 类型不一致 | `code_flag`、`co_flags` 在 `int` 和 `unsigned` 之间混用 | `SetCodeFlags`、`MakeCapturedCode` 等接口统一用 `unsigned` |
-| 遗留注释 | `BreakAtBlock` 中一段 `TODO` 注释块 | 删除 |
+| Signed operands in bitwise operations | `tp->tp_flags & fast_type_mask`, `oparg & 0x08`, `track_result_ & (1 << kTrackBreak)` | cast explicitly to `unsigned` before the bitwise operation |
+| Implicit narrowing (`size_t` to `int`) | `int block_count = bb.size();`, `int nlocals = code_gen.GetLocalsMap().size();` | changed to `static_cast<int>(...)` |
+| Reserved identifier | the custom macro `_Py_MAKECODEUNIT` | renamed to `PY_MAKECODEUNIT`. Names starting with an underscore followed by an uppercase letter are reserved for the implementation in C/C++; this name also clashes with a macro of the same name in the CPython headers, which the original code could only sidestep with `#ifndef` |
+| Missing return in a switch branch | in `IsRepeatWithoutSideEffect`, a `case` contained only a conditional return | added `return false;` to avoid falling through into `default` |
+| Inconsistent types | `code_flag` and `co_flags` mixed `int` and `unsigned` | interfaces such as `SetCodeFlags` and `MakeCapturedCode` now use `unsigned` throughout |
+| Leftover comment | a `TODO` comment block in `BreakAtBlock` | removed |
 
-`cfg.h` 中 `Block` 的标志位判断是一个典型例子：
+The flag checks on `Block` in `cfg.h` are a typical example:
 
 ```cpp
-// 修改前
+// before
 bool IsTrackBreak() const { return track_result_ & (1 << kTrackBreak); }
-// 修改后
+// after
 bool IsTrackBreak() const { return track_result_ & (1 << (unsigned)kTrackBreak); }
 ```
 
-## 回头看：机械地加类型转换的风险
+## Looking back: the risk of adding casts mechanically
 
-这类清理很容易变成“哪里报警就在哪里加一个 cast”。回看这个补丁，有一处转换改变了语义：
+This kind of clean-up easily turns into "add a cast wherever the tool complains". Re-reading the patch, one of the casts changed the semantics:
 
 ```cpp
-// abstract_object.cc, BUILD_CONST_KEY_MAP 分支
-for (Py_ssize_t i = inputs.size() - 2; !err && i >= 0; --i)              // 修改前
-for (Py_ssize_t i = (unsigned)(inputs.size() - 2); !err && i >= 0; --i)  // 修改后
+// abstract_object.cc, BUILD_CONST_KEY_MAP branch
+for (Py_ssize_t i = inputs.size() - 2; !err && i >= 0; --i)              // before
+for (Py_ssize_t i = (unsigned)(inputs.size() - 2); !err && i >= 0; --i)  // after
 ```
 
-当 `inputs.size() < 2` 时，修改前 `size_t` 下溢后再转成 `Py_ssize_t` 得到 -1，循环不执行；修改后先截断成 32 位无符号数 `0xFFFFFFFF`，再转成 64 位的 `Py_ssize_t`，得到一个很大的正数，循环会越界访问。CPython 正常不会生成没有键的 `BUILD_CONST_KEY_MAP`，所以实际很难触发，但更稳妥的写法是：
+When `inputs.size() < 2`, the old code underflows `size_t` and converts it to `Py_ssize_t`, giving -1, so the loop does not run. The new code first truncates to the 32-bit unsigned value `0xFFFFFFFF` and then converts that to a 64-bit `Py_ssize_t`, giving a large positive number, so the loop reads out of bounds. CPython does not normally emit a `BUILD_CONST_KEY_MAP` without keys, so this is hard to trigger in practice, but the safer form is:
 
 ```cpp
 for (Py_ssize_t i = static_cast<Py_ssize_t>(inputs.size()) - 2; !err && i >= 0; --i)
 ```
 
-结论是：消除符号告警时，应该先把操作数转换成目标类型再做运算，而不是对运算结果做转换。
+The takeaway: when silencing sign warnings, convert the operands to the target type before the arithmetic, rather than casting the result of the arithmetic.

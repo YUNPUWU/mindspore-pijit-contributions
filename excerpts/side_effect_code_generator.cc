@@ -1,9 +1,10 @@
 // Excerpt from MindSpore (https://github.com/mindspore-ai/mindspore)
 // Copyright Huawei Technologies Co., Ltd. Licensed under the Apache License, Version 2.0.
 // Snapshot: commit a8005072ba60ddeafffa84ea3d6953f95db179d0 (2024-03-26, merge of PR !67269)
-// 内容: 代码生成阶段：把副作用存活节点作为图输出，图执行完后调用 SideEffect::RestoreSideEffect 回放
-// 说明: 这里是包含我改动的完整函数体，便于阅读上下文；函数中并非每一行都由我编写，
-//       逐行归属请以 patches/ 目录下的原始补丁为准。
+// Contents: Code generation: return side-effect alive nodes as graph outputs, then call SideEffect::RestoreSideEffect after the graph runs to replay them
+// Note: these are the complete bodies of functions that contain my changes, included for context;
+//       not every line in them was written by me. For line-level authorship, see the original
+//       patches in the patches/ directory.
 
 // ---- mindspore/ccsrc/pipeline/jit/pi/graph_capture/code_generator.cc  L992-L1051 ----
 py::object CodeBreakGenerator::MakeCode(bool make_graph, Graph *graph) {

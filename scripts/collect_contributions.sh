@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
-# 从 MindSpore 的 GitHub 镜像重新提取我的全部提交，并按 patch-id 去重导出补丁。
+# Re-extract all my commits from the MindSpore GitHub mirror and export them as
+# patches, de-duplicated by patch-id.
 #
-# 用法: bash scripts/collect_contributions.sh [输出目录]
+# Usage: bash scripts/collect_contributions.sh [output-dir]
 #
-# 使用无树克隆（--filter=tree:0），只下载提交对象，约 50 MB；
-# 查看具体 diff 时 git 会按需拉取对应的 tree 和 blob。
+# Uses a treeless clone (--filter=tree:0) that downloads only commit objects (~50 MB);
+# git fetches the trees and blobs it needs on demand when a diff is shown.
 set -euo pipefail
 
-AUTHOR_EMAIL="wuyunpu1@huawei.com"        # 署名: wu-yunpu / 吴蕴溥 / w30010434
+AUTHOR_EMAIL="wuyunpu1@huawei.com"        # author names: wu-yunpu / 吴蕴溥 / w30010434
 REPO_URL="https://github.com/mindspore-ai/mindspore"
 OUT="${1:-./collected}"
 CLONE="$OUT/mindspore.git"
@@ -18,17 +19,18 @@ if [ ! -d "$CLONE" ]; then
 fi
 git -C "$CLONE" config gc.auto 0
 
-echo "== 全部提交（所有分支）"
+echo "== All commits (all branches)"
 git -C "$CLONE" log --all --no-merges --author="$AUTHOR_EMAIL" \
   --format='%h  %ad  %an  %s' --date=short | tee "$OUT/commits.txt"
 
 echo
-echo "== 我发起的 PR（来自合并提交说明）"
+echo "== PRs I opened (from merge-commit messages)"
+# Merge messages name the PR source as "<author>/<branch>"; my upstream author names are 吴蕴溥 and wu-yunpu.
 git -C "$CLONE" log --all --merges --format='%h  %ad  %s' --date=short \
   | grep -E '吴蕴溥|wu-yunpu' | tee "$OUT/prs.txt"
 
 echo
-echo "== 按 patch-id 去重并导出"
+echo "== De-duplicate by patch-id and export"
 declare -A seen=()
 n=0
 for c in $(git -C "$CLONE" log --all --no-merges --author="$AUTHOR_EMAIL" --reverse --format='%H'); do
@@ -42,4 +44,4 @@ for c in $(git -C "$CLONE" log --all --no-merges --author="$AUTHOR_EMAIL" --reve
   fi
 done
 echo
-echo "共 $n 个内容不同的补丁，已导出到 $OUT/patches/"
+echo "$n distinct patches exported to $OUT/patches/"

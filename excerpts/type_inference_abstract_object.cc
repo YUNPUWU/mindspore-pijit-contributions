@@ -1,9 +1,10 @@
 // Excerpt from MindSpore (https://github.com/mindspore-ai/mindspore)
 // Copyright Huawei Technologies Co., Ltd. Licensed under the Apache License, Version 2.0.
 // Snapshot: commit a8005072ba60ddeafffa84ea3d6953f95db179d0 (2024-03-26, merge of PR !67269)
-// 内容: AbstractTuple 的切片/乘法类型推导
-// 说明: 这里是包含我改动的完整函数体，便于阅读上下文；函数中并非每一行都由我编写，
-//       逐行归属请以 patches/ 目录下的原始补丁为准。
+// Contents: Slicing and repetition type inference for AbstractTuple
+// Note: these are the complete bodies of functions that contain my changes, included for context;
+//       not every line in them was written by me. For line-level authorship, see the original
+//       patches in the patches/ directory.
 
 // ---- mindspore/ccsrc/pipeline/jit/pi/graph_capture/abstract_object.cc  L846-L889 ----
 AObject *AbstractTuple::Binary(AObject *o, int op) {

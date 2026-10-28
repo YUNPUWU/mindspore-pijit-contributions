@@ -1,93 +1,93 @@
-# 01 元组切片与列表乘法的类型推导
+# 01 Type Inference for Tuple Slicing and List Repetition
 
-| 提交 | 日期 | PR | 补丁 |
+| Commit | Date | PR | Patch |
 | --- | --- | --- | --- |
 | `63863e7` support tuple type derive | 2023-11-25 | !62405 | [0001](../patches/01-type-inference/0001-support-tuple-type-derive.patch) |
 | `c9f43f9` support tuple slice type inference | 2023-12-12 | !63085 | [0002](../patches/01-type-inference/0002-support-tuple-slice-type-inference.patch) |
 
-改动文件：`graph_capture/abstract_object.cc`（`AbstractTuple::GetItem`、`AbstractTuple::Binary`）。完整函数见 [excerpts/type_inference_abstract_object.cc](../excerpts/type_inference_abstract_object.cc)。
+Changed file: `graph_capture/abstract_object.cc` (`AbstractTuple::GetItem`, `AbstractTuple::Binary`). The full functions are in [excerpts/type_inference_abstract_object.cc](../excerpts/type_inference_abstract_object.cc).
 
-## 背景
+## Background
 
-`GraphBuilder` 每处理一条字节码，都要给结果算出一个抽象对象（`AObject`）。元组和列表都用 `AbstractTuple` 表示，它记录了每个元素的 `AObject`。只要元素类型已知，后续的 `t[0] + 1`、把元素传给某个算子等操作就能继续推导、继续入图。
+For every bytecode instruction it processes, `GraphBuilder` computes an abstract object (`AObject`) for the result. Tuples and lists are both represented by `AbstractTuple`, which records the `AObject` of each element. As long as the element types are known, later operations such as `t[0] + 1` or passing an element to an operator can still be inferred and put into the graph.
 
-改动之前，`AbstractTuple::GetItem` 只支持整数下标：
+Before this change, `AbstractTuple::GetItem` only supported integer indices:
 
 ```cpp
 Py_ssize_t index = GetTupleIndex(k, this->size());
 if (index == -1) {
-  return AObject::MakeAObject(kTypeAnyValue);   // 切片走到这里，结果变成“未知类型”
+  return AObject::MakeAObject(kTypeAnyValue);   // a slice ends up here and becomes "unknown"
 }
 return items_[index];
 ```
 
-所以 `t[::2]` 这样的切片结果只能推成 `kTypeAnyValue`，后面所有依赖它的节点都失去了类型信息。
+So the result of a slice such as `t[::2]` could only be inferred as `kTypeAnyValue`, and every node depending on it lost its type information.
 
-## 第一版及其问题（!62405）
+## The first version and its problem (!62405)
 
-第一版给 `GetItem` 加上了对 `kTypeSlice` 下标的处理，用 `PySlice_Unpack` 解出 start / stop / step 再构造结果元组。问题在于它**替换**了原来的整数下标分支：非切片下标会返回一个空元组，而不是对应的元素。这是一个回归问题，维护者在 2023-11-29 通过 !62564（`Revert "support tuple type derive"`）把它回退了。
+The first version taught `GetItem` to handle `kTypeSlice` keys: it used `PySlice_Unpack` to get start / stop / step and built the resulting tuple. The problem was that it **replaced** the existing integer-index branch: a non-slice key returned an empty tuple instead of the element. This was a regression, and on 2023-11-29 the maintainers reverted it in !62564 (`Revert "support tuple type derive"`).
 
-这次回退给我的教训是：在已有逻辑上加分支时，原有路径要保持不变，并且要有覆盖原路径的测试。
+The lesson I took from the revert: when adding a branch to existing logic, leave the original path untouched, and make sure tests cover the original path.
 
-## 第二版：增量地加分支（!63085）
+## The second version: adding a branch incrementally (!63085)
 
-第二版只在下标是切片时进入新逻辑，整数下标的原路径一行没动：
+The second version only enters the new logic when the key is a slice; not a single line of the integer-index path changed:
 
 ```cpp
 if (k->GetType() == AObject::kTypeSlice) {
   if (this->GetPyObject().ptr() != nullptr) {
-    return this->AbstractSequence::GetItem(k);       // 有真实对象：交给通用实现按真实值计算
+    return this->AbstractSequence::GetItem(k);       // real object available: let the generic code slice it
   }
-  AObject *resultTuple = AObject::MakeAObject(this->type_);   // 保持 tuple / list 类型不变
+  AObject *resultTuple = AObject::MakeAObject(this->type_);   // keep tuple / list type unchanged
   Py_ssize_t start, stop, step;
   if (PySlice_Unpack(slicePyObject, &start, &stop, &step) < 0) {
     return AObject::MakeAObject(kTypeAnyValue);
   }
   if (start >= stop) {
-    return resultTuple;                               // 空切片
+    return resultTuple;                               // empty slice
   }
   Py_ssize_t sliceLength = PySlice_AdjustIndices(this->items().size(), &start, &stop, step);
   if (start == 0 && step == 1 && sliceLength == this->size()) {
-    return this;                                      // t[:]，直接复用
+    return this;                                      // t[:], reuse as is
   }
-  if (step > 1) { ... 按步长挑出元素 ... }
-  return AObject::MakeAObject(kTypeAnyValue);         // 其他情况保守地退化为未知
+  if (step > 1) { ... pick elements by step ... }
+  return AObject::MakeAObject(kTypeAnyValue);         // anything else conservatively becomes unknown
 }
-// 下面是原来的整数下标逻辑，保持不变
+// the original integer-index logic follows, unchanged
 ```
 
-设计上的几点考虑：
+Design considerations:
 
-- **有真实值就用真实值。** 如果这个元组在追踪时有对应的 Python 对象（比如常量元组），通用实现 `AbstractSequence::GetItem` 可以直接切片得到精确结果，不需要自己推。新逻辑只用于“只知道元素类型、不知道具体值”的元组。
-- **结果类型跟随原容器。** 用 `this->type_` 创建结果，所以列表切片的结果仍然是列表，元组切片的结果仍然是元组（第一版写死成了 `kTypeTuple`）。
-- **用 CPython 的 `PySlice_AdjustIndices` 规范化下标**，处理负数下标、越界等情况，语义和 Python 一致。
-- **整段切片返回 `this`**，避免为 `t[:]` 复制一份抽象对象。
-- **不确定就退化。** 没有实现的情况一律返回 `kTypeAnyValue`，宁可少入图，也不推出错误的类型。
+- **Use the real value when there is one.** If the tuple has a corresponding Python object at trace time (for example, a constant tuple), the generic `AbstractSequence::GetItem` can slice it and get an exact result, so there is nothing to infer. The new logic is only for tuples whose element types are known but whose concrete value is not.
+- **The result type follows the original container.** The result is created with `this->type_`, so slicing a list still gives a list and slicing a tuple gives a tuple (the first version hard-coded `kTypeTuple`).
+- **CPython's `PySlice_AdjustIndices` normalizes the indices**, handling negative indices and out-of-range bounds with the same semantics as Python.
+- **A full slice returns `this`**, so `t[:]` does not copy the abstract object.
+- **When unsure, fall back.** Any case that is not implemented returns `kTypeAnyValue`: better to put less into the graph than to infer a wrong type.
 
-### 列表乘法
+### List repetition
 
-同一个 PR 里还给 `AbstractTuple::Binary` 加了 `list * int` 的推导：
+The same PR also added inference for `list * int` to `AbstractTuple::Binary`:
 
 ```cpp
 if (this->GetType() == kTypeList && op == BINARY_MULTIPLY && o != nullptr && o->GetType() == kTypeInt) {
-  // [a, b] * 3  ->  [a, b, a, b, a, b]，逐个复制元素的抽象对象
+  // [a, b] * 3  ->  [a, b, a, b, a, b], copying each element's abstract object
 }
 ```
 
-这样 `[x] * n` 这种常见的初始化写法之后，每个元素的类型仍然已知。
+After the common initialization idiom `[x] * n`, the type of every element is still known.
 
-## 示例
+## Example
 
 ```python
 @jit(mode="PIJit")
-def f(a, b, c, d):          # a、b、c、d 是 Tensor
+def f(a, b, c, d):          # a, b, c, d are Tensors
     t = (a, b, c, d)
-    u = t[::2]              # 改动前：AnyValue；改动后：(Tensor, Tensor)
-    return u[0] + u[1]      # 改动后可以继续入图
+    u = t[::2]              # before: AnyValue; after: (Tensor, Tensor)
+    return u[0] + u[1]      # after the change, this can still go into the graph
 ```
 
-## 已知不足
+## Known limitations
 
-- `step > 1` 的分支里游标从 0 开始，忽略了 `start`，`t[1::2]` 会选到错误的元素。正确写法是 `for (cursor = start; cursor < stop; cursor += step)`，或者直接用 `sliceLength` 计数。
-- `step == 1` 但不是整段切片（如 `t[1:3]`）、负步长都没有实现，会退化为未知类型。
-- `list * int` 没有检查整数的具体值是否已知。`o->GetPyObject()` 为空时，`PyLong_AsLong` 会返回 -1 并留下一个 Python 异常。应该先判空，取不到值就退化为未知类型。
+- In the `step > 1` branch the cursor starts at 0 and ignores `start`, so `t[1::2]` picks the wrong elements. The correct loop is `for (cursor = start; cursor < stop; cursor += step)`, or simply counting with `sliceLength`.
+- Partial slices with `step == 1` (such as `t[1:3]`) and negative steps are not implemented and fall back to an unknown type.
+- `list * int` does not check whether the integer's value is known. When `o->GetPyObject()` is null, `PyLong_AsLong` returns -1 and leaves a Python exception set. It should check for null first and fall back to an unknown type if the value is unavailable.

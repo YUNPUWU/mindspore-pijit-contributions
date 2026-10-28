@@ -1,9 +1,10 @@
 // Excerpt from MindSpore (https://github.com/mindspore-ai/mindspore)
 // Copyright Huawei Technologies Co., Ltd. Licensed under the Apache License, Version 2.0.
 // Snapshot: commit a8005072ba60ddeafffa84ea3d6953f95db179d0 (2024-03-26, merge of PR !67269)
-// 内容: 图分析阶段：可入图调用判定、副作用节点强制入图、graph break 后清理副作用、强制生成解释执行代码
-// 说明: 这里是包含我改动的完整函数体，便于阅读上下文；函数中并非每一行都由我编写，
-//       逐行归属请以 patches/ 目录下的原始补丁为准。
+// Contents: Graph analysis: deciding which callables can go into the graph, keeping side-effect nodes from blocking capture, clearing side effects after a graph break, forcing interpreter wrapper code
+// Note: these are the complete bodies of functions that contain my changes, included for context;
+//       not every line in them was written by me. For line-level authorship, see the original
+//       patches in the patches/ directory.
 
 // ---- mindspore/ccsrc/pipeline/jit/pi/graph_capture/graph_analyzer.cc  L140-L159 ----
 bool GraphAnalyzer::HandleCallableToGraph(AObject *f) {

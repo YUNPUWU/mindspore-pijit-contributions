@@ -1,10 +1,8 @@
 # MindSpore PIJit Contributions: Side-Effect Handling and Type Inference in a Bytecode JIT
 
-[中文版](README_zh-CN.md)
-
 This repository collects every change I ([@YUNPUWU](https://github.com/YUNPUWU); Gitee `wu-yunpu`; upstream author names `wu-yunpu` / `吴蕴溥` / `w30010434`) contributed to Huawei's open-source AI framework [MindSpore](https://github.com/mindspore-ai/mindspore) between November 2023 and March 2024. For each change, it explains what problem it solves, how it was designed, and why I made the choices I did.
 
-All changes were merged into upstream mainline, and the `v2.3.0` tag on the GitHub mirror contains them. The detailed design documents in [`docs/`](docs/) are written in Chinese; this page covers everything in English.
+All changes were merged into upstream mainline, and the `v2.3.0` tag on the GitHub mirror contains them. Each change has a detailed design document in [`docs/`](docs/).
 
 ## Summary
 
@@ -120,8 +118,8 @@ As of the latest master on the GitHub mirror (July 2024), teammates have rewritt
 
 ```
 .
-├── README.md / README_zh-CN.md   overview (English / Chinese)
-├── docs/                         design docs (Chinese)
+├── README.md                     overview
+├── docs/                         design docs
 │   ├── 00-pijit-primer.md        how PIJit works
 │   ├── 01-type-inference.md      tuple slicing and list repetition type inference
 │   ├── 02-graph-build-fixes.md   loop-head break, FOR_ITER, LIST_EXTEND, keyword-only arguments

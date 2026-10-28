@@ -1,77 +1,77 @@
-# PIJit 原理入门
+# PIJit Primer
 
-这篇文档给没接触过 PIJit 的读者补背景，后面几篇设计文档都建立在这里的概念上。内容基于 MindSpore r2.3 时期（2024 年 3 月）的代码，路径都相对于 `mindspore/ccsrc/pipeline/jit/pi/`。
+This document gives background to readers who have not worked with PIJit; the design documents that follow build on the concepts introduced here. It describes the code as of MindSpore r2.3 (March 2024), and all paths are relative to `mindspore/ccsrc/pipeline/jit/pi/`.
 
-## 1. 为什么需要 PIJit
+## 1. Why PIJit exists
 
-MindSpore 有两种执行方式：
+MindSpore has two execution modes:
 
-- **静态图（`PSJit`，GRAPH_MODE）**：解析 Python 源码的 AST，翻译成 MindSpore IR 再整体编译。性能好，但只支持 Python 语法的一个子集，写法稍微“动态”一点就报错。
-- **动态图（PYNATIVE_MODE）**：逐条执行 Python，灵活但慢。
+- **Static graph (`PSJit`, GRAPH_MODE)**: parses the AST of the Python source, translates it into MindSpore IR and compiles it as a whole. It is fast, but supports only a subset of Python syntax; code that is even slightly "dynamic" fails to compile.
+- **Dynamic graph (PYNATIVE_MODE)**: runs Python statement by statement. It is flexible but slow.
 
-PIJit 走中间路线，用法是 `jit(fn=func, mode="PIJit")`。它在 **Python 字节码** 层面工作：能编译进图的部分编译成图，编译不了的部分交回解释器执行。用户不需要为了能编译而改写代码。这和 PyTorch 2.x 的 TorchDynamo 思路一致。
+PIJit takes the middle road and is used as `jit(fn=func, mode="PIJit")`. It works at the **Python bytecode** level: the parts that can be compiled into a graph are compiled, and the parts that cannot are handed back to the interpreter. Users do not need to rewrite their code to make it compilable. This is the same approach as TorchDynamo in PyTorch 2.x.
 
-## 2. 入口：PEP 523 帧求值钩子
+## 2. Entry point: the PEP 523 frame-evaluation hook
 
-`common.cc` 用 `_PyInterpreterState_SetEvalFrameFunc` 把 CPython 的帧求值函数替换成 `pijit::EvalFrame`。一个被标记的函数被调用时：
+`common.cc` uses `_PyInterpreterState_SetEvalFrameFunc` to replace CPython's frame-evaluation function with `pijit::EvalFrame`. When a marked function is called:
 
-1. 先查 **Guard 缓存**（`graph_guard/`）：之前编译过、且这次的输入满足编译时记录的 Guard 条件，就直接复用编译结果。
-2. 否则进入编译流程，生成一个新的 Python 代码对象，替换掉原函数的 `f_code` 再执行。
+1. It first checks the **guard cache** (`graph_guard/`). If the function was compiled before and this call's inputs satisfy the guard conditions recorded at compile time, the compiled result is reused directly.
+2. Otherwise it runs the compilation pipeline, produces a new Python code object, replaces the original function's `f_code` with it, and executes it.
 
-## 3. 编译流程
+## 3. The compilation pipeline
 
 ```mermaid
 flowchart LR
-    BC["原始字节码"] --> GB["GraphBuilder<br/>graph_capture/graph_build.cc"]
+    BC["original bytecode"] --> GB["GraphBuilder<br/>graph_capture/graph_build.cc"]
     GB --> GA["GraphAnalyzer<br/>graph_capture/graph_analyzer.cc"]
     GA --> BI["BytecodeInliner<br/>graph_capture/bytecode_inliner.cc"]
     BI --> CG["CodeBreakGenerator<br/>graph_capture/code_generator.cc"]
-    CG --> NEW["新字节码<br/>调用图 + 解释执行剩余部分"]
+    CG --> NEW["new bytecode<br/>call graph + interpret the rest"]
 ```
 
-### 3.1 GraphBuilder：符号执行字节码
+### 3.1 GraphBuilder: symbolic execution of bytecode
 
-`GraphBuilder::TraceRun` 从第一条指令开始，用一个模拟的帧（`FrameStates`：局部变量、操作数栈、闭包）逐条“执行”字节码。每条指令由 `DoByteCode` 分发到对应的处理函数，例如 `DoItemAccess` 处理 `BINARY_SUBSCR` / `STORE_SUBSCR`，`DoGlobalAccess` 处理 `LOAD_GLOBAL` / `STORE_GLOBAL`。
+`GraphBuilder::TraceRun` starts at the first instruction and "executes" the bytecode one instruction at a time on a simulated frame (`FrameStates`: locals, operand stack, closures). `DoByteCode` dispatches each instruction to its handler; for example, `DoItemAccess` handles `BINARY_SUBSCR` / `STORE_SUBSCR` and `DoGlobalAccess` handles `LOAD_GLOBAL` / `STORE_GLOBAL`.
 
-执行过程中产生两类数据：
+This produces two kinds of data:
 
-- **ValueNode 图**：每个值是一个 `ValueNode`，记录产生它的 opcode、输入节点、所在 bci。函数调用是 `CallNode`，可以带一个被内联的子图。
-- **AObject 抽象类型**（`abstract_object.cc`）：每个 `ValueNode` 挂一个 `AObject`，描述“这是什么类型的对象、知不知道具体值、元素是什么类型”。例如 `AbstractTuple` 记录每个元素的 `AObject`。类型推导做得越细，后面能入图的东西越多。
+- **The ValueNode graph**: every value is a `ValueNode` that records the opcode that produced it, its input nodes and its bci. A function call is a `CallNode`, which can carry an inlined sub-graph.
+- **AObject abstract types** (`abstract_object.cc`): every `ValueNode` has an `AObject` describing what kind of object it is, whether its concrete value is known, and what types its elements have. For example, `AbstractTuple` records the `AObject` of each element. The more precise the type inference, the more can be put into the graph later.
 
-某条指令处理不了时，`StopTraceAt(bci, reason)` 记录断点，追踪停止。
+When an instruction cannot be handled, `StopTraceAt(bci, reason)` records a break point and tracing stops.
 
-### 3.2 GraphAnalyzer：决定哪些节点入图
+### 3.2 GraphAnalyzer: deciding what goes into the graph
 
-`GraphAnalyzer::Analyze` 从返回值和断点处的存活变量往回看，把节点分成两类：
+`GraphAnalyzer::Analyze` works backwards from the return value and the variables alive at the break point, and splits the nodes into two groups:
 
-- **captured**：能交给 MindSpore 编译的节点，主要是 Tensor 运算、Primitive、Cell 调用。
-- **escaped**：必须由 Python 解释器执行的节点，比如调用未知的 Python 函数。
+- **captured**: nodes that can be handed to MindSpore for compilation, mainly tensor operations, Primitives and Cell calls.
+- **escaped**: nodes that must be executed by the Python interpreter, such as calls to unknown Python functions.
 
-分析结束时还会决定 `need_interpret_`：如果整个函数都能入图，并且参数、返回值都是图支持的类型，就可以直接调用图，完全不生成 Python 包装代码。
+At the end of the analysis it also decides `need_interpret_`: if the whole function can go into the graph and its parameters and return value are all graph-supported types, PIJit can call the graph directly without generating any Python wrapper code.
 
-### 3.3 CodeBreakGenerator：生成新字节码
+### 3.3 CodeBreakGenerator: generating new bytecode
 
-`CodeBreakGenerator::MakeCode` 生成替换原函数的新代码对象，大致顺序是：
+`CodeBreakGenerator::MakeCode` produces the new code object that replaces the original function. Roughly, it emits:
 
-1. `Build()`：生成解释执行部分（escaped 节点）的字节码；
-2. `CallCapturedCode` + `FixInterpretOuput`：把 captured 部分包装成名为 `<pijit.compile>` 的函数并调用，再把图的输出拆包写回局部变量；
-3. （我新增的）回放副作用：`SideEffect::RestoreSideEffect`；
-4. `CallUntrackedCode`：断点之后的原始字节码被打包成名为 `<pijit.resume>` 的新函数并调用，`BreakAtIf` / `BreakAtBlock` 分别处理断在 if 分支、with/try/for 代码块上的情况；
-5. `MakeReturn`。
+1. `Build()`: bytecode for the interpreted part (escaped nodes);
+2. `CallCapturedCode` + `FixInterpretOuput`: wraps the captured part in a function named `<pijit.compile>`, calls it, and unpacks the graph outputs back into locals;
+3. (added by me) side-effect replay: `SideEffect::RestoreSideEffect`;
+4. `CallUntrackedCode`: packs the original bytecode after the break point into a new function named `<pijit.resume>` and calls it; `BreakAtIf` / `BreakAtBlock` handle breaks inside an `if` branch and inside `with` / `try` / `for` blocks respectively;
+5. `MakeReturn`.
 
-### 3.4 断图次数
+### 3.4 Break count
 
-每发生一次断图，`get_code_extra(func)["break_count_"]` 加一。`tests/st/pi_jit/` 下的很多用例就是用 `break_count_ == 0` 判断一个特性是否被完整支持，我写的副作用测试也沿用了这个做法。
+Every graph break increments `get_code_extra(func)["break_count_"]`. Many cases under `tests/st/pi_jit/` use `break_count_ == 0` to decide whether a feature is fully supported, and my side-effect tests follow the same convention.
 
-## 4. 我的改动落在哪里
+## 4. Where my changes are
 
-| 阶段 | 文件 | 我的改动 |
+| Stage | File | My changes |
 | --- | --- | --- |
-| 抽象类型 | `abstract_object.cc` | 元组切片、列表乘法的类型推导 |
-| 构图 | `graph_build.cc` | `DoSideEffect`、`STORE_SUBSCR` 分支、`LIST_EXTEND` 常量展开、循环头停止追踪、放宽 `ReplaceAll` |
-| 构图 | `node.cc` | `store_attr` / `store_subscr` 不再直接改写共享的抽象对象 |
-| 分析 | `graph_analyzer.cc` | `HandleCallableToGraph`、`HandleSideEffectNodeForCapture`、断图后清理副作用 |
-| 内联 | `bytecode_inliner.cc` | 子图副作用合并、冗余 `STORE_DEREF` 消除 |
-| 代码生成 | `code_generator.cc` | `FOR_ITER` 断点修复、kw-only 参数、副作用存活节点与回放 |
-| 新模块 | `side_effect.h/.cc` | `SideEffect` 类 |
-| 测试 | `tests/st/pi_jit/control_flow/test_side_effect.py` | 8 个副作用用例 |
+| Abstract types | `abstract_object.cc` | type inference for tuple slicing and list repetition |
+| Graph building | `graph_build.cc` | `DoSideEffect`, the `STORE_SUBSCR` branch, constant expansion for `LIST_EXTEND`, stopping at loop heads, relaxing `ReplaceAll` |
+| Graph building | `node.cc` | `store_attr` / `store_subscr` no longer modify shared abstract objects directly |
+| Analysis | `graph_analyzer.cc` | `HandleCallableToGraph`, `HandleSideEffectNodeForCapture`, clearing side effects after a graph break |
+| Inlining | `bytecode_inliner.cc` | merging sub-graph side effects, removing redundant `STORE_DEREF` |
+| Code generation | `code_generator.cc` | `FOR_ITER` break-point fix, keyword-only arguments, side-effect alive nodes and replay |
+| New module | `side_effect.h/.cc` | the `SideEffect` class |
+| Tests | `tests/st/pi_jit/control_flow/test_side_effect.py` | 8 side-effect cases |
